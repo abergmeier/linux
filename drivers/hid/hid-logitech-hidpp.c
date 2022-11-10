@@ -360,15 +360,16 @@ static int hidpp_send_fap_command_sync(struct hidpp_device *hidpp,
 }
 
 static int hidpp_send_rap_command_sync(struct hidpp_device *hidpp_dev,
-	u8 report_id, u8 sub_id, u8 reg_address, u8 *params, int param_count,
+	u8 sub_id, u8 reg_address, u8 *params, int param_count,
 	struct hidpp_report *response)
 {
 	struct hidpp_report *message;
 	int ret, max_count;
+	u8 report_id;
 
-	/* Send as long report if short reports are not supported. */
-	if (report_id == REPORT_ID_HIDPP_SHORT &&
-	    !(hidpp_dev->supported_reports & HIDPP_REPORT_SHORT_SUPPORTED))
+	if (hidpp_dev->supported_reports & HIDPP_REPORT_SHORT_SUPPORTED)
+		report_id = REPORT_ID_HIDPP_SHORT;
+	else
 		report_id = REPORT_ID_HIDPP_LONG;
 
 	switch (report_id) {
@@ -549,7 +550,6 @@ static int hidpp10_set_register(struct hidpp_device *hidpp_dev,
 	u8 params[3] = { 0 };
 
 	ret = hidpp_send_rap_command_sync(hidpp_dev,
-					  REPORT_ID_HIDPP_SHORT,
 					  HIDPP_GET_REGISTER,
 					  register_address,
 					  NULL, 0, &response);
@@ -562,7 +562,6 @@ static int hidpp10_set_register(struct hidpp_device *hidpp_dev,
 	params[byte] |= value & mask;
 
 	return hidpp_send_rap_command_sync(hidpp_dev,
-					   REPORT_ID_HIDPP_SHORT,
 					   HIDPP_SET_REGISTER,
 					   register_address,
 					   params, 3, &response);
@@ -658,7 +657,6 @@ static int hidpp10_query_battery_status(struct hidpp_device *hidpp)
 	int ret, status;
 
 	ret = hidpp_send_rap_command_sync(hidpp,
-					REPORT_ID_HIDPP_SHORT,
 					HIDPP_GET_REGISTER,
 					HIDPP_REG_BATTERY_STATUS,
 					NULL, 0, &response);
@@ -710,7 +708,6 @@ static int hidpp10_query_battery_mileage(struct hidpp_device *hidpp)
 	int ret, status;
 
 	ret = hidpp_send_rap_command_sync(hidpp,
-					REPORT_ID_HIDPP_SHORT,
 					HIDPP_GET_REGISTER,
 					HIDPP_REG_BATTERY_MILEAGE,
 					NULL, 0, &response);
@@ -782,7 +779,6 @@ static char *hidpp_unifying_get_name(struct hidpp_device *hidpp_dev)
 	int len;
 
 	ret = hidpp_send_rap_command_sync(hidpp_dev,
-					REPORT_ID_HIDPP_SHORT,
 					HIDPP_GET_LONG_REGISTER,
 					HIDPP_REG_PAIRING_INFORMATION,
 					params, 1, &response);
@@ -816,7 +812,6 @@ static int hidpp_unifying_get_serial(struct hidpp_device *hidpp, u32 *serial)
 	u8 params[1] = { HIDPP_EXTENDED_PAIRING };
 
 	ret = hidpp_send_rap_command_sync(hidpp,
-					REPORT_ID_HIDPP_SHORT,
 					HIDPP_GET_LONG_REGISTER,
 					HIDPP_REG_PAIRING_INFORMATION,
 					params, 1, &response);
@@ -900,7 +895,6 @@ static int hidpp_root_get_protocol_version(struct hidpp_device *hidpp)
 	int ret;
 
 	ret = hidpp_send_rap_command_sync(hidpp,
-			REPORT_ID_HIDPP_SHORT,
 			HIDPP_PAGE_ROOT_IDX,
 			CMD_ROOT_GET_PROTOCOL_VERSION,
 			ping_data, sizeof(ping_data), &response);
@@ -3180,7 +3174,6 @@ static int m560_send_config_command(struct hid_device *hdev, bool connected)
 
 	return hidpp_send_rap_command_sync(
 		hidpp_dev,
-		REPORT_ID_HIDPP_SHORT,
 		M560_SUB_ID,
 		M560_BUTTON_MODE_REGISTER,
 		(u8 *)m560_config_parameter,
@@ -3719,7 +3712,6 @@ static int hidpp_initialize_hires_scroll(struct hidpp_device *hidpp)
 		struct hidpp_report response;
 
 		ret = hidpp_send_rap_command_sync(hidpp,
-						  REPORT_ID_HIDPP_SHORT,
 						  HIDPP_GET_REGISTER,
 						  HIDPP_ENABLE_FAST_SCROLL,
 						  NULL, 0, &response);

@@ -4438,12 +4438,16 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (hidpp->quirks & HIDPP_QUIRK_UNIFYING)
 		hidpp_unifying_init(hidpp);
 
-	connected = hidpp_root_get_protocol_version(hidpp) == 0;
+	ret = hidpp_root_get_protocol_version(hidpp);
+	connected = ret == 0;
 	atomic_set(&hidpp->connected, connected);
 	if (!(hidpp->quirks & HIDPP_QUIRK_UNIFYING)) {
 		if (!connected) {
+			if (ret == -ETIMEDOUT)
+				hid_err(hdev, "Device connection timed out");
+			else
+				hid_err(hdev, "Device not connected");
 			ret = -ENODEV;
-			hid_err(hdev, "Device not connected");
 			goto hid_hw_init_fail;
 		}
 

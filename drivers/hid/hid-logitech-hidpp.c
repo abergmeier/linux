@@ -1751,75 +1751,20 @@ static int hidpp_set_wireless_feature_index(struct hidpp_device *hidpp)
 #define HIDPP_ILLUMINATION_FUNC_GET_COLOR_TEMPERATURE 0x80
 #define HIDPP_ILLUMINATION_FUNC_SET_COLOR_TEMPERATURE 0x90
 
+/* Not yet supported
+#define HIDPP_ILLUMINATION_FUNC_GET_COLOR_TEMPERATURE_LEVELS 0xA0
+#define HIDPP_ILLUMINATION_FUNC_SET_COLOR_TEMPERATURE_LEVELS 0xB0
+*/
+
 #define HIDPP_ILLUMINATION_EVENT_CHANGE 0x00
 #define HIDPP_ILLUMINATION_EVENT_BRIGHTNESS_CHANGE 0x10
 #define HIDPP_ILLUMINATION_EVENT_COLOR_TEMPERATURE_CHANGE 0x20
 
-#define HIDPP_ILLUMINATION_CAP_NON_LINEAR_LEVELS 0x04
-#define HIDPP_ILLUMINATION_CAP_LINEAR_LEVELS 0x02
-#define HIDPP_ILLUMINATION_CAP_EVENTS 0x01
+#define HIDPP_ILLUMINATION_CAP_EVENTS BIT(0)
+#define HIDPP_ILLUMINATION_CAP_LINEAR_LEVELS BIT(1)
+#define HIDPP_ILLUMINATION_CAP_NON_LINEAR_LEVELS BIT(2)
 
-struct led_data {
-	struct led_classdev cdev;
-	struct hidpp_device *drv_data;
-	struct hid_device *hdev;
-	struct work_struct work;
-	u16 feature_index;
-	bool on;
-	unsigned int brightness;
-	bool removed;
-};
-
-static enum led_brightness led_brightness_get(struct led_classdev *led_cdev) {
-	struct led_data *led = container_of(led_cdev, struct led_data,
-		cdev);
-
-	if (!led->on) {
-		return LED_OFF;
-	}
-
-	return led->brightness + 1;
-}
-
-static void led_brightness_set(struct led_classdev *led_cdev, enum led_brightness brightness) {
-	struct led_data *led = container_of(led_cdev, struct led_data,
-		cdev);
-	led->on = brightness != 0;
-	if (led->on) {
-		led->brightness = brightness - 1;
-	}
-
-	schedule_work(&led->work);
-}
-
-static void led_work(struct work_struct *work)
-{
-	struct hidpp_device *hidpp;
-	u8 params[20];
-	int ret;
-	struct hidpp_report report;
-	struct led_data *led = container_of(work, struct led_data, work);
-
-	if (led->removed)
-		return;
-
-	hidpp = led->drv_data;
-
-	memset(&params, 0, sizeof(params)/sizeof(*params));
-	if (!led->on) {
-		ret = hidpp_send_fap_command_sync(hidpp, hidpp->illumination_feature_index, HIDPP_ILLUMINATION_FUNC_SET, params, 20, &report);
-		if (ret) {
-			return;
-		}
-	}
-
-	ret = hidpp_send_fap_command_sync(hidpp, hidpp->illumination_feature_index, HIDPP_ILLUMINATION_FUNC_SET_BRIGHTNESS, params, 20, &report);
-	if (ret) {
-		return;
-	}
-}
-
-struct control_info{
+struct control_info {
 	u16 min;
 	u16 max;
 	u16 res;
@@ -1827,93 +1772,280 @@ struct control_info{
 	u8 max_levels;
 };
 
-static int get_brightness_info_sync(struct hidpp_device *hidpp, struct control_info* info) {
-	struct hidpp_report resp;
-	int ret = hidpp_send_fap_command_sync(hidpp, hidpp->illumination_feature_index, HIDPP_ILLUMINATION_FUNC_GET_BRIGHTNESS_INFO, NULL, 0, &resp);
-	if (ret)
+struct led_data {
+	struct led_classdev cdev;
+	struct hidpp_device *drv_data;
+	struct hid_device *hdev;
+	u16 feature_index;
+	atomic_t on;
+	atomic_t brightness;
+	struct control_info brightness_info;
+	struct control_info color_temperature_info;
+	char dirname[256];
+	bool removed;
+};
+
+/* kernel led interface designates 0 as off. To not lose the ability to chose
+ * minimal brightness, we thus need to increase the reported range by 1
+ */
+static unsigned device_to_led_brightness(struct led_data* led, u16 device_brightness) {
+	u16 relative = device_brightness - led->brightness_info.min;
+	u16 step = relative / led->brightness_info.res;
+	return step + 1;
+}
+
+static u16 led_to_device_brightness(struct led_data* led, unsigned led_brightness) {
+	unsigned step = led_brightness - 1;
+	unsigned relative = step * led->brightness_info.res;
+	return led->brightness_info.min + relative;
+}
+
+static int request_led_brightness(struct hidpp_device *hidpp, struct led_data *led, u16 *brightness) {
+	struct hidpp_report report;
+
+	int ret = hidpp_send_fap_command_sync(
+		hidpp, hidpp->illumination_feature_index,
+		HIDPP_ILLUMINATION_FUNC_GET_BRIGHTNESS, NULL, 0, &report);
+	if (ret) {
+		hid_err(hidpp->hid_dev,
+			"Getting Illumination Brightness failed\n");
 		return ret;
+	}
+
+	*brightness = get_unaligned_be16(&report.fap.params[0]);
+	atomic_set(&led->brightness, *brightness);
+	return device_to_led_brightness(led, *brightness);
+}
+
+static enum led_brightness led_brightness_get(struct led_classdev *led_cdev)
+{
+	bool on;
+	u16 device_brightness, brightness;
+	struct hidpp_report report;
+	struct led_data *led = container_of(led_cdev, struct led_data, cdev);
+	struct hidpp_device *hidpp = led->drv_data;
+
+	int ret = hidpp_send_fap_command_sync(hidpp,
+					  hidpp->illumination_feature_index,
+					  HIDPP_ILLUMINATION_FUNC_GET, NULL,
+					  0, &report);
+	if (ret) {
+		hid_err(hidpp->hid_dev, "Getting Illumination failed\n");
+		if (ret == -ETIMEDOUT) {
+			on = atomic_read(&led->on);
+			device_brightness = atomic_read(&led->brightness);
+		}
+		if (!on) {
+			return LED_OFF;
+		}
+		return device_to_led_brightness(led, device_brightness);
+	}
+
+	on = report.fap.params[0] & BIT(0);
+	atomic_set(&led->on, on);
+
+	if (!on) {
+		return LED_OFF;
+	}
+
+	ret = request_led_brightness(hidpp, led, &brightness);
+	if (ret) {
+		return LED_OFF;
+	}
+	return brightness;
+}
+
+
+static void led_brightness_set_dummy(struct led_classdev *led_cdev,
+			enum led_brightness led_brightness) {
+}
+
+static int led_brightness_set_sync(struct led_classdev *led_cdev,
+			       enum led_brightness led_brightness)
+{
+	struct hidpp_report report;
+	int ret;
+	struct led_data *led = container_of(led_cdev, struct led_data, cdev);
+	struct hidpp_device *hidpp = led->drv_data;
+	u16 device_brightness = led_to_device_brightness(led, led_brightness);
+
+	bool on = led_brightness != 0;
+	u8 params[2] = { on ? BIT(0) : 0, 0 };
+	atomic_set(&led->on, on);
+	if (on) {
+		atomic_set(&led->brightness, device_brightness);
+	}
+
+	ret = hidpp_send_fap_command_sync(hidpp,
+					  hidpp->illumination_feature_index,
+					  HIDPP_ILLUMINATION_FUNC_SET, params,
+					  1, &report);
+	if (ret) {
+		hid_err(hidpp->hid_dev, "Setting Illumination failed\n");
+		return ret;
+	}
+
+	if (!on)
+		return 0;
+	
+	put_unaligned_be16(device_brightness, params);
+	ret = hidpp_send_fap_command_sync(
+		hidpp, hidpp->illumination_feature_index,
+		HIDPP_ILLUMINATION_FUNC_SET_BRIGHTNESS, params, 2,
+		&report);
+	if (ret) {
+		hid_err(hidpp->hid_dev,
+			"Setting Illumination Brightness failed\n");
+	}
+	return ret;
+}
+
+static int get_brightness_info_sync(struct hidpp_device *hidpp,
+				    struct control_info *info)
+{
+	struct hidpp_report resp;
+	int ret = hidpp_send_fap_command_sync(
+		hidpp, hidpp->illumination_feature_index,
+		HIDPP_ILLUMINATION_FUNC_GET_BRIGHTNESS_INFO, NULL, 0, &resp);
+	if (ret) {
+		hid_err(hidpp->hid_dev,
+			"get_brightness_info_sync failed with %d\n", ret);
+		return ret;
+	}
 
 	info->capabilities = resp.fap.params[0];
-	info->min = be16_to_cpu(resp.fap.params[1] << 8 | resp.fap.params[2] << 0);
-	info->max = be16_to_cpu(resp.fap.params[3] << 8 | resp.fap.params[4] << 0);
-	info->res = be16_to_cpu(resp.fap.params[5] << 8 | resp.fap.params[6] << 0);
+	info->min = get_unaligned_be16(&resp.fap.params[1]);
+	info->max = get_unaligned_be16(&resp.fap.params[3]);
+	info->res = get_unaligned_be16(&resp.fap.params[5]);
 	info->max_levels = resp.fap.params[7];
 	return 0;
 }
 
-static int get_color_temperature_info_sync(struct hidpp_device *hidpp, struct control_info* info) {
+static int get_color_temperature_info_sync(struct hidpp_device *hidpp,
+					   struct control_info *info)
+{
 	struct hidpp_report resp;
-	int ret = hidpp_send_fap_command_sync(hidpp, hidpp->illumination_feature_index, HIDPP_ILLUMINATION_FUNC_GET_COLOR_TEMPERATURE_INFO, NULL, 0, &resp);
-	if (ret)
+	int ret = hidpp_send_fap_command_sync(
+		hidpp, hidpp->illumination_feature_index,
+		HIDPP_ILLUMINATION_FUNC_GET_COLOR_TEMPERATURE_INFO, NULL, 0,
+		&resp);
+	if (ret) {
+		hid_err(hidpp->hid_dev,
+			"get_color_temperature_info_sync failed with %d\n",
+			ret);
 		return ret;
+	}
 
 	info->capabilities = resp.fap.params[0];
-	info->min = be16_to_cpu(resp.fap.params[1] << 8 | resp.fap.params[2] << 0);
-	info->max = be16_to_cpu(resp.fap.params[3] << 8 | resp.fap.params[4] << 0);
-	info->res = be16_to_cpu(resp.fap.params[5] << 8 | resp.fap.params[6] << 0);
+	info->min = get_unaligned_be16(&resp.fap.params[1]);
+	info->max = get_unaligned_be16(&resp.fap.params[3]);
+	info->res = get_unaligned_be16(&resp.fap.params[5]);
 	info->max_levels = resp.fap.params[7];
 	return 0;
 }
 
 static int register_led(struct hidpp_device *hidpp)
 {
-	struct control_info bi, cti;
-	struct led_data *ld;
-	int ret = get_brightness_info_sync(hidpp, &bi);
-	if (ret)
-		return ret;
+	char buf[256];
+	int ret;
+	unsigned brightness_range, r = 0, w = 0;
+	struct led_data *led = devm_kzalloc(&hidpp->hid_dev->dev, sizeof(struct led_data),
+			  GFP_KERNEL);
 
-	if (bi.res != 1) {
-		// FAIL - not supported
-		return -1;
-	}
-
-	ret = get_color_temperature_info_sync(hidpp, &cti);
-	if (ret)
-		return ret;
-
-	if (cti.res != 1) {
-		// FAIL - not supported
-		return -1;
-	}
-
-	ld = devm_kzalloc(&hidpp->hid_dev->dev,
-		sizeof(struct led_data),
-		GFP_KERNEL);
-	if (!ld)
+	if (!led)
 		return -ENOMEM;
 
-	ld->drv_data = hidpp;
-	ld->removed = false;
-	ld->cdev.name = hidpp->name;
-	ld->cdev.flags = LED_HW_PLUGGABLE | LED_BRIGHT_HW_CHANGED;
-	/* kernel led interface designates 0 as off. To not lose the ability to chose
-	 * minimal brightness, we thus need to increase the reported range by 1
-	 */
-	ld->cdev.max_brightness = bi.max - bi.min + 1;
-	if (bi.max == bi.min) {
-		/* According to docs set value is not supported under these
-		 * conditions
-		 */
-		ld->cdev.brightness_set = NULL;
-	} else {
-		ld->cdev.brightness_set = led_brightness_set;
-	}
-	ld->cdev.brightness_get = led_brightness_get;
+	ret = get_brightness_info_sync(hidpp, &led->brightness_info);
+	if (ret)
+		goto cleanup;
 
-	INIT_WORK(&ld->work, led_work);
-	ret = devm_led_classdev_register(&hidpp->hid_dev->dev, &ld->cdev);
-	if (ret < 0) {
-		/* No need to have this still around */
-		devm_kfree(&hidpp->hid_dev->dev, ld);
+	ret = get_color_temperature_info_sync(hidpp,
+					      &led->color_temperature_info);
+	if (ret)
+		goto cleanup;
+
+	led->drv_data = hidpp;
+	led->removed = false;
+	memzero_explicit(buf, 256);
+	strscpy(buf, hidpp->name, 256);
+	while (w != 256) {
+		char c = buf[r];
+		if (c == '\'' || c == '\"') {
+			if (r != 255) {
+				r++;
+			}
+			continue;
+		}
+		buf[w] = buf[r];
+		w++;
+		if (r != 255) {
+			r++;
+		}
 	}
-	hidpp->private_data = ld;
+	strreplace(buf, ' ', '_');
+	snprintf(led->dirname, sizeof(led->dirname) / sizeof(*led->dirname),
+		 "%s::illumination", buf);
+	atomic_set(&led->on, false);
+	atomic_set(&led->brightness, led->brightness_info.min);
+	led->cdev.name = led->dirname;
+	led->cdev.flags = LED_HW_PLUGGABLE | LED_BRIGHT_HW_CHANGED;
+	led->cdev.max_brightness = device_to_led_brightness(led, led->brightness_info.max);
+	brightness_range = led->brightness_info.max - led->brightness_info.min;
+	if (brightness_range == 0) {
+		/* According to docs set value is not supported under these
+		 * conditions.
+		 * LED interface enforces a set function.
+		 */
+		led->cdev.brightness_set = led_brightness_set_dummy;
+	} else {
+		led->cdev.brightness_set_blocking = led_brightness_set_sync;
+	}
+	led->cdev.brightness_get = led_brightness_get;
+
+	ret = devm_led_classdev_register(&hidpp->hid_dev->dev, &led->cdev);
+	if (ret < 0) {
+		goto cleanup;
+	}
+	hidpp->private_data = led;
+	return 0;
+cleanup:
+	devm_kfree(&hidpp->hid_dev->dev, led);
+	return ret;
+}
+
+static int hidpp_initialize_illumination(struct hidpp_device *hidpp)
+{
+	int ret;
+	unsigned long capabilities = hidpp->capabilities;
+
+	if (hidpp->protocol_major >= 2) {
+		u8 feature_index;
+		u8 feature_type;
+
+		ret = hidpp_root_get_feature(hidpp,
+					     HIDPP_PAGE_ILLUMINATION_LIGHT,
+					     &feature_index, &feature_type);
+		if (!ret && !(feature_type & HIDPP_FEATURE_TYPE_HIDDEN)) {
+			hidpp->capabilities |=
+				HIDPP_CAPABILITY_ILLUMINATION_LIGHT;
+			hidpp->illumination_feature_index = feature_index;
+			hid_dbg(hidpp->hid_dev,
+				"Detected HID++ 2.0 Illumination Light\n");
+			return 0;
+		}
+	}
+
+	if (hidpp->capabilities == capabilities)
+		hid_dbg(hidpp->hid_dev,
+			"Did not detect HID++ Illumination Light hardware support\n");
 	return 0;
 }
 
-static int hidpp20_illumination_raw_event(struct hidpp_device *hidpp, u8 *data, int size) {
-
-	struct led_data *led;
+static int hidpp20_illumination_raw_event(struct hidpp_device *hidpp, u8 *data,
+					  int size)
+{
+	u16 led_brightness;
+	struct led_data *led = (struct led_data *)hidpp->private_data;
 	struct hidpp_report *report = (struct hidpp_report *)data;
 	switch (report->report_id) {
 	case REPORT_ID_HIDPP_LONG:
@@ -1922,6 +2054,7 @@ static int hidpp20_illumination_raw_event(struct hidpp_device *hidpp, u8 *data, 
 		 */
 		break;
 	default:
+		hid_err(hidpp->hid_dev, "%s:Unhandled report_id %u\n", __func__, report->report_id);
 		return 0;
 	}
 
@@ -1929,49 +2062,33 @@ static int hidpp20_illumination_raw_event(struct hidpp_device *hidpp, u8 *data, 
 		return 0;
 	}
 
-	led = (struct led_data*)hidpp->private_data;
-
 	if (report->fap.funcindex_clientid == HIDPP_ILLUMINATION_EVENT_CHANGE) {
-		led->on = report->fap.params[0] & 0x1;
-		if (led->on )
-			led_classdev_notify_brightness_hw_changed(&led->cdev, led->brightness + 1);
-		else
-			led_classdev_notify_brightness_hw_changed(&led->cdev, LED_OFF);
+		bool on = report->fap.params[0] & BIT(0);
+		hid_err(hidpp->hid_dev, "%s: HIDPP_ILLUMINATION_EVENT_CHANGE\n", __func__);
+		atomic_set(&led->on, on);
+		if (on) {
+			int ret = request_led_brightness(hidpp, led, &led_brightness);
+			if (ret) {
+				led_brightness = LED_OFF;
+			}
+		}
+
+		led_classdev_notify_brightness_hw_changed(
+			&led->cdev, led_brightness);
 		return 0;
 	}
 
-	if (report->fap.funcindex_clientid == HIDPP_ILLUMINATION_EVENT_BRIGHTNESS_CHANGE) {
-		u16 brightness = be16_to_cpu(report->fap.params[0] << 8 | report->fap.params[1] << 0);
-		led->brightness = brightness;
-		led_classdev_notify_brightness_hw_changed(&led->cdev, led->brightness + 1);
+	if (report->fap.funcindex_clientid ==
+	    HIDPP_ILLUMINATION_EVENT_BRIGHTNESS_CHANGE) {
+		u16 device_brightness = get_unaligned_be16(&report->fap.params[0]);
+		atomic_set(&led->brightness, device_brightness);
+		led_brightness = device_to_led_brightness(led, device_brightness);
+		led_classdev_notify_brightness_hw_changed(&led->cdev,
+							  led_brightness);
 		return 0;
 	}
 
 	return 0;
-}
-
-static int hidpp20_illumination_connect(struct hidpp_device *hidpp) {
-
-	u8 feature_index, feature_type;
-	int ret = hidpp_root_get_feature(hidpp,
-				     HIDPP_PAGE_ILLUMINATION_LIGHT,
-				     &feature_index,
-				     &feature_type);
-	if (ret)
-		return ret;
-
-	if (feature_type & HIDPP_FEATURE_TYPE_HIDDEN) {
-		/* According to docs the host should ignore this feature */
-		return -ENOENT;
-	}
-
-	hidpp->illumination_feature_index = feature_index;
-
-	ret = register_led(hidpp);
-	if (!ret)
-		hidpp->capabilities |= HIDPP_CAPABILITY_ILLUMINATION_LIGHT;
-
-	return ret;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -4221,6 +4338,7 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 
 	hidpp_initialize_battery(hidpp);
 	hidpp_initialize_hires_scroll(hidpp);
+	hidpp_initialize_illumination(hidpp);
 
 	/* forward current battery state */
 	if (hidpp->capabilities & HIDPP_CAPABILITY_HIDPP10_BATTERY) {
@@ -4243,6 +4361,14 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 	if (hidpp->capabilities & HIDPP_CAPABILITY_HI_RES_SCROLL)
 		hi_res_scroll_enable(hidpp);
 
+	if (hidpp->capabilities & HIDPP_CAPABILITY_ILLUMINATION_LIGHT) {
+		ret = register_led(hidpp);
+		if (ret) {
+			hid_err(hdev, "Registering leds failed.\n");
+			return;
+		}
+	}
+
 	if (!(hidpp->quirks & HIDPP_QUIRK_NO_HIDINPUT) || hidpp->delayed_input)
 		/* if the input nodes are already created, we can stop now */
 		return;
@@ -4262,8 +4388,6 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 	}
 
 	hidpp->delayed_input = input;
-
-	ret = hidpp20_illumination_connect(hidpp);
 }
 
 static DEVICE_ATTR(builtin_power_supply, 0000, NULL, NULL);
@@ -4612,6 +4736,9 @@ static const struct hid_device_id hidpp_devices[] = {
 		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS},
 	{ /* Logitech G Pro Gaming Mouse over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC088) },
+	{ /* Logitech Litra Glow over USB*/
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_LITRA_GLOW),
+		.driver_data = /*HIDPP_QUIRK_DELAYED_INIT |*/ HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
 
 	{ /* MX5000 keyboard over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb305),

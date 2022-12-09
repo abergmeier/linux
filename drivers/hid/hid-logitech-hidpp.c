@@ -78,6 +78,7 @@ MODULE_PARM_DESC(disable_tap_to_click,
 #define HIDPP_QUIRK_HIDPP_WHEELS		BIT(26)
 #define HIDPP_QUIRK_HIDPP_EXTRA_MOUSE_BTNS	BIT(27)
 #define HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS	BIT(28)
+#define HIDPP_QUIRK_CLASS_ILLUMINATION	BIT(29)
 
 /* These are just aliases for now */
 #define HIDPP_QUIRK_KBD_SCROLL_WHEEL HIDPP_QUIRK_HIDPP_WHEELS
@@ -1777,8 +1778,6 @@ struct led_data {
 	struct hidpp_device *drv_data;
 	struct hid_device *hdev;
 	u16 feature_index;
-	atomic_t on;
-	atomic_t brightness;
 	struct control_info brightness_info;
 	struct control_info color_temperature_info;
 	char dirname[256];
@@ -1800,7 +1799,8 @@ static u16 led_to_device_brightness(struct led_data* led, unsigned led_brightnes
 	return led->brightness_info.min + relative;
 }
 
-static int request_led_brightness(struct hidpp_device *hidpp, struct led_data *led, u16 *brightness) {
+static int request_led_brightness(struct hidpp_device *hidpp, struct led_data *led, u16 *led_brightness) {
+	u16 device_brightness;
 	struct hidpp_report report;
 
 	int ret = hidpp_send_fap_command_sync(
@@ -1812,15 +1812,15 @@ static int request_led_brightness(struct hidpp_device *hidpp, struct led_data *l
 		return ret;
 	}
 
-	*brightness = get_unaligned_be16(&report.fap.params[0]);
-	atomic_set(&led->brightness, *brightness);
-	return device_to_led_brightness(led, *brightness);
+	device_brightness = get_unaligned_be16(&report.fap.params[0]);
+	*led_brightness = device_to_led_brightness(led, device_brightness);
+	return 0;
 }
 
 static enum led_brightness led_brightness_get(struct led_classdev *led_cdev)
 {
 	bool on;
-	u16 device_brightness, brightness;
+	u16 brightness;
 	struct hidpp_report report;
 	struct led_data *led = container_of(led_cdev, struct led_data, cdev);
 	struct hidpp_device *hidpp = led->drv_data;
@@ -1831,18 +1831,10 @@ static enum led_brightness led_brightness_get(struct led_classdev *led_cdev)
 					  0, &report);
 	if (ret) {
 		hid_err(hidpp->hid_dev, "Getting Illumination failed\n");
-		if (ret == -ETIMEDOUT) {
-			on = atomic_read(&led->on);
-			device_brightness = atomic_read(&led->brightness);
-		}
-		if (!on) {
-			return LED_OFF;
-		}
-		return device_to_led_brightness(led, device_brightness);
+		return LED_OFF;
 	}
 
 	on = report.fap.params[0] & BIT(0);
-	atomic_set(&led->on, on);
 
 	if (!on) {
 		return LED_OFF;
@@ -1871,10 +1863,6 @@ static int led_brightness_set_sync(struct led_classdev *led_cdev,
 
 	bool on = led_brightness != 0;
 	u8 params[2] = { on ? BIT(0) : 0, 0 };
-	atomic_set(&led->on, on);
-	if (on) {
-		atomic_set(&led->brightness, device_brightness);
-	}
 
 	ret = hidpp_send_fap_command_sync(hidpp,
 					  hidpp->illumination_feature_index,
@@ -1917,7 +1905,7 @@ static int get_brightness_info_sync(struct hidpp_device *hidpp,
 	info->min = get_unaligned_be16(&resp.fap.params[1]);
 	info->max = get_unaligned_be16(&resp.fap.params[3]);
 	info->res = get_unaligned_be16(&resp.fap.params[5]);
-	info->max_levels = resp.fap.params[7];
+	info->max_levels = resp.fap.params[7] & 0x0F;
 	return 0;
 }
 
@@ -1985,8 +1973,6 @@ static int register_led(struct hidpp_device *hidpp)
 	strreplace(buf, ' ', '_');
 	snprintf(led->dirname, sizeof(led->dirname) / sizeof(*led->dirname),
 		 "%s::illumination", buf);
-	atomic_set(&led->on, false);
-	atomic_set(&led->brightness, led->brightness_info.min);
 	led->cdev.name = led->dirname;
 	led->cdev.flags = LED_HW_PLUGGABLE | LED_BRIGHT_HW_CHANGED;
 	led->cdev.max_brightness = device_to_led_brightness(led, led->brightness_info.max);
@@ -2065,7 +2051,6 @@ static int hidpp20_illumination_raw_event(struct hidpp_device *hidpp, u8 *data,
 	if (report->fap.funcindex_clientid == HIDPP_ILLUMINATION_EVENT_CHANGE) {
 		bool on = report->fap.params[0] & BIT(0);
 		hid_err(hidpp->hid_dev, "%s: HIDPP_ILLUMINATION_EVENT_CHANGE\n", __func__);
-		atomic_set(&led->on, on);
 		if (on) {
 			int ret = request_led_brightness(hidpp, led, &led_brightness);
 			if (ret) {
@@ -2081,7 +2066,6 @@ static int hidpp20_illumination_raw_event(struct hidpp_device *hidpp, u8 *data,
 	if (report->fap.funcindex_clientid ==
 	    HIDPP_ILLUMINATION_EVENT_BRIGHTNESS_CHANGE) {
 		u16 device_brightness = get_unaligned_be16(&report->fap.params[0]);
-		atomic_set(&led->brightness, device_brightness);
 		led_brightness = device_to_led_brightness(led, device_brightness);
 		led_classdev_notify_brightness_hw_changed(&led->cdev,
 							  led_brightness);
@@ -4539,11 +4523,15 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		hid_warn(hdev, "Cannot allocate sysfs group for %s\n",
 			 hdev->name);
 
-	/*
-	 * Plain USB connections need to actually call start and open
-	 * on the transport driver to allow incoming data.
-	 */
-	ret = hid_hw_start(hdev, 0);
+	if (hidpp->quirks & HIDPP_QUIRK_CLASS_ILLUMINATION) {
+		ret = hid_hw_start(hdev, HID_CLAIMED_DRIVER);
+	} else {
+		/*
+		* Plain USB connections need to actually call start and open
+		* on the transport driver to allow incoming data.
+		*/
+		ret = hid_hw_start(hdev, 0);
+	}
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
 		goto hid_hw_start_fail;
@@ -4597,6 +4585,10 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	}
 
 	hidpp_connect_event(hidpp);
+
+	/* Resetting HID node made communication with Glow break down*/
+	if (hidpp->quirks & HIDPP_QUIRK_CLASS_ILLUMINATION)
+		return 0;
 
 	/* Reset the HID node state */
 	hid_device_io_stop(hdev);
@@ -4738,7 +4730,7 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC088) },
 	{ /* Logitech Litra Glow over USB*/
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_LITRA_GLOW),
-		.driver_data = /*HIDPP_QUIRK_DELAYED_INIT |*/ HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
+		.driver_data = HIDPP_QUIRK_CLASS_ILLUMINATION | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
 
 	{ /* MX5000 keyboard over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb305),
